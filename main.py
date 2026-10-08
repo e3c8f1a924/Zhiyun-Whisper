@@ -8,6 +8,7 @@ Usage:
 
 import os
 import sys
+from datetime import datetime
 
 import click
 from dotenv import load_dotenv
@@ -49,6 +50,49 @@ def _get_session(require_auth: bool = False) -> "requests.Session":
         username, password = _get_credentials()
         session = login(username, password)
     return session
+
+
+def _resolve_courses_file(courses_file: str | None) -> str:
+    """Resolve the course profile path from CLI arg, env, or the default."""
+    return (
+        courses_file
+        or os.getenv("COURSES_FILE", "").strip().strip('"')
+        or "courses.json"
+    )
+
+
+def _get_summary_llm_config() -> dict:
+    """Build the summary LLM config (SUMMARY_*), falling back to LLM_*."""
+    cfg = {
+        "api_base": os.getenv("SUMMARY_API_BASE", "").strip().strip('"'),
+        "api_key": os.getenv("SUMMARY_API_KEY", "").strip().strip('"'),
+        "model": os.getenv("SUMMARY_MODEL", "").strip().strip('"'),
+    }
+    if not cfg["api_base"]:
+        cfg["api_base"] = os.getenv("LLM_API_BASE", "").strip().strip('"')
+    if not cfg["api_key"]:
+        cfg["api_key"] = os.getenv("LLM_API_KEY", "").strip().strip('"')
+    if not cfg["model"]:
+        cfg["model"] = os.getenv("LLM_MODEL", "gpt-4o-mini").strip().strip('"')
+    if not cfg["api_base"] or not cfg["api_key"]:
+        raise click.ClickException(
+            "SUMMARY_API_BASE/SUMMARY_API_KEY (or LLM_API_BASE/LLM_API_KEY) "
+            "must be set in .env"
+        )
+
+    fallback = {
+        "api_base": os.getenv("SUMMARY_FALLBACK_API_BASE", "").strip().strip('"'),
+        "api_key": os.getenv("SUMMARY_FALLBACK_API_KEY", "").strip().strip('"'),
+        "model": os.getenv("SUMMARY_FALLBACK_MODEL", "").strip().strip('"'),
+    }
+    if any(fallback.values()):
+        if not all(fallback.values()):
+            raise click.ClickException(
+                "SUMMARY_FALLBACK_API_BASE, SUMMARY_FALLBACK_API_KEY and "
+                "SUMMARY_FALLBACK_MODEL must all be set, or all left empty."
+            )
+        cfg["fallback"] = fallback
+    return cfg
 
 
 @click.group()
@@ -217,9 +261,8 @@ def list_lessons(course_id: str):
 @click.option(
     "--keywords",
     "-k",
-    default="小测,点到,考勤,点名,随堂测试,学在浙大,quiz,雷达",
-    show_default=True,
-    help="Comma-separated list of keywords to watch for",
+    default=None,
+    help="Comma-separated keywords (unioned with course profile and built-in defaults)",
 )
 @click.option(
     "--chunk-duration",
@@ -265,6 +308,17 @@ def list_lessons(course_id: str):
     default=False,
     help="Print each chunk's transcription to stdout",
 )
+@click.option(
+    "--courses-file",
+    default=None,
+    help="Course profile file (default: COURSES_FILE env or courses.json)",
+)
+@click.option(
+    "--no-summarize",
+    is_flag=True,
+    default=False,
+    help="Disable automatic course summary generation at stream end",
+)
 def monitor(
     course_id,
     keywords,
@@ -275,6 +329,8 @@ def monitor(
     log_dir,
     debug,
     batch_size,
+    courses_file,
+    no_summarize,
 ):
     """Monitor a Zhiyun live stream and send DingTalk alerts on keyword detection."""
     from src.live_monitor import monitor_loop, fetch_live_courses, TokenExpiredError, check_llm_apis
@@ -330,8 +386,18 @@ def monitor(
 
     check_llm_apis(**llm_config, debug=debug)
 
-    keyword_list = [kw.strip() for kw in keywords.split(",") if kw.strip()]
-    click.echo(f"Monitoring course {course_id} for keywords: {keyword_list}")
+    cli_keywords = None
+    if keywords:
+        cli_keywords = [kw.strip() for kw in keywords.split(",") if kw.strip()]
+
+    from src.summarizer import load_course_profiles, resolve_keywords
+
+    courses_file = _resolve_courses_file(courses_file)
+    profiles = load_course_profiles(courses_file)
+
+    summary_llm_config = None
+    if not no_summarize:
+        summary_llm_config = _get_summary_llm_config()
 
     # Load course priority list from .env
     priority_raw = os.getenv("MONITOR_PRIORITY", "").strip().strip('"')
@@ -452,6 +518,12 @@ def monitor(
                     )
                     sys.exit(0)
 
+    profile = profiles.get(course_id)
+    keyword_list = resolve_keywords(cli_keywords=cli_keywords, profile=profile)
+    if not course_title and profile:
+        course_title = profile.get("course_title", "") or course_title
+    click.echo(f"Monitoring course {course_id} for keywords: {keyword_list}")
+
     monitor_loop(
         session=session,
         course_id=course_id,
@@ -467,6 +539,108 @@ def monitor(
         debug=debug,
         credentials=credentials,
         batch_size=batch_size,
+        summarize=not no_summarize,
+        courses_file=courses_file,
+        summary_llm_config=summary_llm_config,
+    )
+
+
+@cli.command()
+@click.option(
+    "--course-id",
+    "-c",
+    required=True,
+    help="Course ID from the classroom URL",
+)
+@click.option(
+    "--date",
+    default=None,
+    help="Log date YYYY-MM-DD (default: today)",
+)
+@click.option(
+    "--log-dir",
+    default="logs",
+    show_default=True,
+    help="Directory containing transcript logs",
+)
+@click.option(
+    "--courses-file",
+    default=None,
+    help="Course profile file (default: COURSES_FILE env or courses.json)",
+)
+@click.option(
+    "--no-dingtalk",
+    is_flag=True,
+    default=False,
+    help="Do not push the summary digest to DingTalk",
+)
+@click.option(
+    "--debug",
+    is_flag=True,
+    default=False,
+    help="Print the raw LLM summary response",
+)
+def summarize(course_id, date, log_dir, courses_file, no_dingtalk, debug):
+    """Generate a course summary from an existing transcript log."""
+    from src.summarizer import (
+        load_course_profiles,
+        resolve_keywords,
+        run_summary,
+    )
+
+    date_str = date or datetime.now().strftime("%Y-%m-%d")
+    log_path = os.path.join(log_dir, f"{course_id}_{date_str}.txt")
+    if not os.path.exists(log_path):
+        click.echo(f"Error: transcript log not found: {log_path}", err=True)
+        sys.exit(1)
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            transcript = f.read()
+    except OSError as exc:
+        click.echo(f"Error reading {log_path}: {exc}", err=True)
+        sys.exit(1)
+    if not transcript.strip():
+        click.echo(f"Error: transcript log is empty: {log_path}", err=True)
+        sys.exit(1)
+
+    courses_file = _resolve_courses_file(courses_file)
+    profiles = load_course_profiles(courses_file)
+    profile = profiles.get(course_id)
+    keywords = resolve_keywords(cli_keywords=None, profile=profile)
+    course_title = (profile or {}).get("course_title", "") or course_id
+
+    summary_llm_config = _get_summary_llm_config()
+
+    notifier_config = None
+    if not no_dingtalk:
+        webhook = os.getenv("DINGTALK_WEBHOOK", "").strip().strip('"')
+        secret = os.getenv("DINGTALK_SECRET", "").strip().strip('"')
+        if webhook and secret:
+            at_mobile = os.getenv("DINGTALK_AT_MOBILE", "").strip().strip('"')
+            notifier_config = {
+                "webhook": webhook,
+                "secret": secret,
+                "at_mobiles": [at_mobile] if at_mobile else [],
+            }
+
+    summary = run_summary(
+        transcript=transcript,
+        course_id=course_id,
+        course_title=course_title,
+        keywords=keywords,
+        courses_file=courses_file,
+        summary_llm_config=summary_llm_config,
+        notifier_config=notifier_config,
+        log_dir=log_dir,
+        date_str=date_str,
+        push_dingtalk=not no_dingtalk,
+        debug=debug,
+    )
+    if summary is None:
+        click.echo("Summary generation failed; see error output above.", err=True)
+        sys.exit(1)
+    click.echo(
+        f"Done! Summary: {os.path.join(log_dir, f'{course_id}_{date_str}.summary.md')}"
     )
 
 

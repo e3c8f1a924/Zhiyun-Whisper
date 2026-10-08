@@ -11,6 +11,7 @@
 - **实时直播监控** — 支持旧版和新版 `ilive` 课堂，检测「小测、点到、考勤」等关键词，通过钉钉机器人推送提醒
 - **自动检测当前直播** — 无需手动指定课程 ID，从课表自动发现正在直播的课程
 - **持久转录日志** — 每次直播的全文转录按课程+日期写入 `logs/` 目录永久保存
+- **课程自动总结** — 课程结束后用 LLM 生成总结（主要内容、重要事项、考勤/小测统计与关键词有效性分析），并自适应维护每门课的关键词档案
 - **Token 自动刷新** — 设置 `ZJU_USERNAME`/`ZJU_PASSWORD` 后，监控进程检测到 Token 过期时自动重新登录，无需人工干预
 
 ## 前置条件
@@ -60,6 +61,17 @@ LLM_MODEL="gpt-4o-mini"
 LLM_FALLBACK_API_BASE=""
 LLM_FALLBACK_API_KEY=""
 LLM_FALLBACK_MODEL=""
+
+# 课程总结 LLM（可选）— 未配置时回退复用上面的 LLM_*，建议用更强的模型
+SUMMARY_API_BASE="https://api.openai.com/v1"
+SUMMARY_API_KEY="sk-xxx"
+SUMMARY_MODEL="gpt-4o"
+SUMMARY_FALLBACK_API_BASE=""
+SUMMARY_FALLBACK_API_KEY=""
+SUMMARY_FALLBACK_MODEL=""
+
+# 课程档案文件（课程代码 → 关键词 + 说话风格等），默认 courses.json
+COURSES_FILE="courses.json"
 
 # 直播监控 - 多课程优先级（逗号分隔的 course_id，靠前的优先）
 MONITOR_PRIORITY="81771,83640"   # 多课程同时直播时自动选择优先级最高的
@@ -187,8 +199,14 @@ python main.py monitor --model small --debug
 # 指定课程 ID
 python main.py monitor --course-id 81706
 
-# 自定义关键词
+# 自定义关键词（与课程档案关键词、内置默认关键词取并集）
 python main.py monitor --keywords "小测,随堂测验,点名"
+
+# 关闭课程结束自动总结
+python main.py monitor --no-summarize
+
+# 指定课程档案文件（默认 courses.json，或 COURSES_FILE 环境变量）
+python main.py monitor --courses-file courses.json
 
 # 调试模式（打印每个 30s 音频块的转录文本和 LLM 分析）
 python main.py monitor --debug
@@ -202,7 +220,9 @@ python main.py monitor --log-dir logs --chunks-dir chunks
 | 选项 | 默认值 | 说明 |
 |------|--------|------|
 | `--course-id` | 自动检测 | 课程 ID，省略时从课表自动发现直播 |
-| `--keywords` | `小测,点到,考勤,点名,学在浙大,quiz,雷达` | 逗号分隔的关键词 |
+| `--keywords` | 内置默认 | 逗号分隔的关键词，与课程档案、默认列表取并集 |
+| `--courses-file` | `courses.json` | 课程档案文件（可用 `COURSES_FILE` 环境变量覆盖） |
+| `--no-summarize` | 关 | 关闭课程结束时的自动总结 |
 | `--model` | `qwen3-asr-1.7b` | 支持 Qwen 1.7b/0.6b、云端 qwen3-asr-flash 或 Whisper tiny/base/small/medium/large-v3 等 |
 | `--batch-size` | Qwen: `1` / Whisper: `16` | 本地推理批处理大小，增大需要更多显存 |
 | `--chunk-duration` | `30` | 每段音频长度（秒） |
@@ -227,10 +247,51 @@ python main.py monitor --log-dir logs --chunks-dir chunks
 5. 命中后（包括逐字命中）用一次 LLM 调用返回结构化判断、确认关键词、原文证据和解释；结合最近 3 段语境，以最新片段为判断对象
 6. 确认后通过钉钉 Webhook 推送告警（含课程名称、时间、确认关键词、证据、分析、最近转录原文），发送成功后 120 秒冷却；明确否定时不推送。主 LLM 调用或结果校验失败时尝试已配置的备用 LLM，所有已配置服务均失败后发送标明「疑似命中（语义确认失败）」的提醒
 7. 网络中断或 auth_key 过期时自动重连；直播结束（status 变化）时退出
+8. 直播结束后，将本次完整转录提交给总结 LLM（默认 `SUMMARY_*`，未配置则复用 `LLM_*`），生成 `logs/{course_id}_{date}.summary.md` 并向钉钉推送精要版；根据分析结果更新 `courses.json` 中的关键词与说话风格记录
 
 语义判断仍按「提及相关事项就提醒」，包括预告、回顾或否定该事项，不要求正在执行。提示词要求区分「分享到／来到」与考勤「点到」、测试与随堂小测。确认关键词必须来自配置列表，证据必须能在最新转录中找到；标题使用 LLM 确认的关键词。模型的默认思考模式保持不变，仅解析最终正文中的 JSON 判断。
 
 **备用 LLM：** 在 `.env` 填写 `LLM_FALLBACK_API_BASE`、`LLM_FALLBACK_API_KEY`、`LLM_FALLBACK_MODEL` 后启用；三项全空时保持原有行为，只填部分会在启动时报错。主服务遇到连接错误、超时、限流或服务端错误时，由 SDK 最多重试两次（含首次请求最多三次），耗尽后尝试备用服务；备用服务使用同样的重试策略。鉴权失败等不可重试错误，以及正文解析或结果校验失败，会直接进入备用流程。主服务明确返回否定时不调用备用；备用的有效肯定或否定正常生效。每个新片段仍先尝试主服务，备用服务同样使用最近转录、思考正文清理和证据校验。
+
+### 课程总结与关键词档案
+
+课程结束时自动调用总结 LLM，生成包含四部分的总结：**主要内容**、**重要事项**（作业/DDL/测试/调课等）、**考勤与小测统计**（含关键词是否命中）以及**关键词有效性分析**；分析会结合该老师的说话风格（如用「大家把书收起来」代替「小测」）。
+
+总结产物：
+- `logs/{course_id}_{date}.summary.md` — 完整 Markdown 总结
+- 钉钉推送 — 精简摘要（主要内容 + 重要事项 + 关键词调整）
+- `courses.json` — 关键词档案更新（见下）
+
+**关键词档案 `courses.json`**（默认路径，可用 `--courses-file` 或 `COURSES_FILE` 覆盖）：
+
+```json
+{
+  "87120": {
+    "course_title": "大学物理（甲）",
+    "keywords": ["大家把书收起来", "查一下人数"],
+    "style_notes": "老师常把“小测”说成“大家把书收起来”；把“点名”说成“查一下人数”。",
+    "updated_at": "2026-10-08T11:14:00",
+    "history": [
+      {"at": "2026-10-08T11:14:00", "add": ["大家把书收起来"], "remove": [], "style_notes_update": "..."}
+    ]
+  }
+}
+```
+
+每次监控时，**生效关键词 = `--keywords` ∪ 档案 `keywords` ∪ 内置默认**（最保守，宁可多匹配不漏报）。总结 LLM 建议的新增词会写入档案；建议移除的词**只影响档案中自定义添加的词**，内置默认词与命令行词永不删除。
+
+**手动补跑总结：** 对已有日志重新生成总结（不监控直播）：
+
+```bash
+# 总结今天某门课的日志
+python main.py summarize --course-id 87120
+
+# 总结历史某天的日志
+python main.py summarize --course-id 87120 --date 2026-10-06
+
+# 不推送钉钉
+python main.py summarize --course-id 87120 --no-dingtalk
+```
 
 ## 输出
 
@@ -265,6 +326,7 @@ python main.py monitor --log-dir logs --chunks-dir chunks
   [14:22:45] 同学们今天我们讲量词...
   [14:23:15] 好现在开始小测大家把书收起来...
   ```
+- 直播结束后生成 **课程总结** 保存在 `logs/{course_id}_{日期}.summary.md`，并向钉钉推送精简摘要
 
 ## 依赖说明
 

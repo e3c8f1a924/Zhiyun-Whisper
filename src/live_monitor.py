@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 import requests
 
 from src.crawler import CATALOGUE_API
+from src.llm_utils import extract_final_answer as _extract_llm_answer
 from src.session_utils import mount_legacy_ssl
 
 GET_SUB_INFO_API = (
@@ -392,24 +393,6 @@ def check_keywords_pinyin(
 # ---------------------------------------------------------------------------
 
 
-def _extract_llm_answer(content: str | None) -> str:
-    """Extract final text when a provider leaks thinking markers into content.
-
-    Some providers omit the opening <think> tag, e.g. '否</think>否'.
-    Only text after the last closing tag is a final answer. A separate
-    reasoning_content field must never be used as a fallback answer.
-    """
-    if not isinstance(content, str):
-        raise ValueError("LLM returned no final answer")
-
-    answer = content.rsplit("</think>", 1)[-1].strip()
-    if "<think>" in answer:
-        raise ValueError("LLM returned an unfinished thinking block")
-    if not answer:
-        raise ValueError("LLM returned no final answer")
-    return answer
-
-
 @dataclass(frozen=True)
 class AlertDecision:
     should_alert: bool
@@ -691,6 +674,9 @@ def monitor_loop(
     debug: bool = False,
     credentials: tuple[str, str] | None = None,
     batch_size: int | None = None,
+    summarize: bool = False,
+    courses_file: str = "courses.json",
+    summary_llm_config: dict | None = None,
 ) -> None:
     """
     Full monitoring pipeline:
@@ -704,6 +690,7 @@ def monitor_loop(
        d. Send confirmed or explicitly unconfirmed fallback notifications,
           with a 120-second cooldown between delivered alerts.
        e. Delete the chunk to save disk space.
+    4. When the stream ends, optionally generate and persist a course summary.
     """
     from src.transcriber import load_local_model
     from src.notifier import send_dingtalk
@@ -743,6 +730,7 @@ def monitor_loop(
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, f"{course_id}_{date.today().isoformat()}.txt")
     print(f"[monitor] Transcript log → {log_path}")
+    start_offset = os.path.getsize(log_path) if os.path.exists(log_path) else 0
 
     recent_entries: deque[str] = deque(maxlen=5)  # rolling last-5-chunks buffer
     last_alert_time = 0.0
@@ -750,6 +738,7 @@ def monitor_loop(
     EMPTY_THRESHOLD = 5  # consecutive silent chunks before checking live status
     last_end_check_time = 0.0
     END_CHECK_INTERVAL = 60.0  # poll is_stream_ended every 60 seconds
+    stop_requested = False
 
     while True:
         # Check if stream is still live
@@ -792,7 +781,8 @@ def monitor_loop(
                         last_end_check_time = now
                         if is_stream_ended(session, course_id, live_sub_id):
                             print("[monitor] Periodic check: stream ended. Stopping monitor.")
-                            return
+                            stop_requested = True
+                            break
 
                     if not full_text.strip():
                         consecutive_empty += 1
@@ -803,7 +793,8 @@ def monitor_loop(
                             )
                             if is_stream_ended(session, course_id, live_sub_id):
                                 print("[monitor] Stream ended. Stopping monitor.")
-                                return
+                                stop_requested = True
+                                break
                             consecutive_empty = 0  # reset after check
                         continue
 
@@ -880,6 +871,29 @@ def monitor_loop(
         except Exception as exc:
             logger.error("Stream processing error: %s", exc)
 
+        if stop_requested:
+            break
+
         # ffmpeg exited — check if stream is still live before restarting
         print("[monitor] ffmpeg stopped, checking if stream is still active...")
         time.sleep(5)  # brief pause before retry
+
+    # --- Phase 4: course summary on stream end ---
+    if summarize:
+        try:
+            from src.summarizer import finalize_course_summary
+
+            finalize_course_summary(
+                log_path=log_path,
+                start_offset=start_offset,
+                course_id=course_id,
+                course_title=course_title,
+                keywords=keywords,
+                courses_file=courses_file,
+                summary_llm_config=summary_llm_config,
+                notifier_config=notifier_config,
+                log_dir=log_dir,
+                debug=debug,
+            )
+        except Exception as exc:
+            logger.error("Course summary finalization failed: %s", exc)
