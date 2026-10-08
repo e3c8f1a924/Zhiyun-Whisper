@@ -15,6 +15,7 @@ from main import cli
 from src.crawler import Lesson
 from src.live_monitor import monitor_loop
 from src.qwen_asr_backend import QwenTranscriber, _aligned_segments, _language_name
+from src.qwen_api_backend import QwenApiTranscriber
 from src.transcriber import DEFAULT_MODEL, Segment, load_local_model, transcribe_local
 
 
@@ -296,6 +297,120 @@ class MonitorModelReuseTests(unittest.TestCase):
             logs = list(Path(tmp).glob("course1_*.txt"))
             self.assertEqual(len(logs), 1)
             self.assertEqual(logs[0].read_text().count("课堂内容"), 2)
+
+
+class QwenApiTranscriberTests(unittest.TestCase):
+    API_ENV = {"ASR_API_BASE": "https://asr.invalid/v1", "ASR_API_KEY": "sk-test",
+               "ASR_MODEL": "qwen3-asr-flash"}
+
+    @staticmethod
+    def _fake_parse(raw, user_language=None):
+        s = str(raw).strip()
+        if "<asr_text>" in s:
+            lang, _, rest = s.partition("<asr_text>")
+            return lang.replace("language", "").strip(), rest.replace("</asr_text>", "").strip()
+        return "", s
+
+    def _make_wav(self, path, seconds):
+        with wave.open(str(path), "wb") as audio:
+            audio.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+            audio.writeframes(b"\0\0" * int(16000 * seconds))
+
+    def _completed(self, content):
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    def test_model_routing_resolves_api_aliases(self):
+        for alias, model_id in (("qwen3-asr-flash", "qwen3-asr-flash"), ("asr-flash", None),
+                                ("qwen-asr-api", None)):
+            with self.subTest(alias=alias), patch("src.qwen_api_backend.QwenApiTranscriber") as api, redirect_stdout(io.StringIO()):
+                load_local_model(alias)
+                api.assert_called_once_with(model_id=model_id)
+
+    def test_missing_config_has_setup_instructions(self):
+        with patch.dict("os.environ", {"ASR_API_BASE": "", "ASR_API_KEY": ""}):
+            self.assertRaisesRegex(RuntimeError, "ASR_API_BASE", QwenApiTranscriber)
+
+    def test_transcribe_sends_base64_audio_and_strips_wrapper(self):
+        stub = ModuleType("qwen_asr")
+        stub.parse_asr_output = self._fake_parse
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", self.API_ENV), \
+             patch.dict("sys.modules", {"qwen_asr": stub}), patch("openai.OpenAI") as openai_cls, \
+             redirect_stdout(io.StringIO()):
+            audio_path = Path(tmp) / "chunk.wav"
+            self._make_wav(audio_path, 0.5)
+            openai_cls.return_value.chat.completions.create.return_value = \
+                self._completed("language Chinese<asr_text>你好世界</asr_text>")
+            model = QwenApiTranscriber()
+            segments = model.transcribe(str(audio_path), language="zh")
+
+        self.assertEqual([s.text for s in segments], ["你好世界"])
+        self.assertEqual((segments[0].start, segments[0].end), (0.0, 0.5))
+        create = openai_cls.return_value.chat.completions.create
+        create.assert_called_once()
+        kwargs = create.call_args.kwargs
+        self.assertEqual(kwargs["model"], "qwen3-asr-flash")
+        # Bailian asr task: single audio block, no text instruction allowed
+        (audio_block,) = kwargs["messages"][0]["content"]
+        self.assertEqual(audio_block["type"], "audio")
+        self.assertTrue(audio_block["audio"].startswith("data:audio/wav;base64,"))
+
+    def test_plain_text_response_passes_through(self):
+        stub = ModuleType("qwen_asr")
+        stub.parse_asr_output = self._fake_parse
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", self.API_ENV), \
+             patch.dict("sys.modules", {"qwen_asr": stub}), patch("openai.OpenAI") as openai_cls, \
+             redirect_stdout(io.StringIO()):
+            audio_path = Path(tmp) / "chunk.wav"
+            self._make_wav(audio_path, 0.5)
+            openai_cls.return_value.chat.completions.create.return_value = self._completed("直接返回的文本")
+            model = QwenApiTranscriber()
+            segments = model.transcribe(str(audio_path), language="zh")
+        self.assertEqual([s.text for s in segments], ["直接返回的文本"])
+
+    def test_audio_url_fallback_when_first_format_rejected(self):
+        stub = ModuleType("qwen_asr")
+        stub.parse_asr_output = self._fake_parse
+
+        class Rejected(Exception):
+            status_code = 400
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", self.API_ENV), \
+             patch.dict("sys.modules", {"qwen_asr": stub}), patch("openai.OpenAI") as openai_cls, \
+             redirect_stdout(io.StringIO()):
+            audio_path = Path(tmp) / "chunk.wav"
+            self._make_wav(audio_path, 0.5)
+            create = openai_cls.return_value.chat.completions.create
+            create.side_effect = [Rejected("audio item not supported"), self._completed("回退成功")]
+            model = QwenApiTranscriber()
+            segments = model.transcribe(str(audio_path), language="zh")
+
+        self.assertEqual([s.text for s in segments], ["回退成功"])
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual(create.call_args_list[0].kwargs["messages"][0]["content"][0]["type"], "audio")
+        self.assertEqual(create.call_args_list[1].kwargs["messages"][0]["content"][0]["type"], "input_audio")
+
+    def test_long_audio_is_split_and_merged_with_offsets(self):
+        stub = ModuleType("qwen_asr")
+        stub.parse_asr_output = self._fake_parse
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", self.API_ENV), \
+             patch.dict("sys.modules", {"qwen_asr": stub}), patch("openai.OpenAI") as openai_cls, \
+             redirect_stdout(io.StringIO()):
+            audio_path = Path(tmp) / "long.wav"
+            self._make_wav(audio_path, 61)
+            calls = []
+
+            def fake_create(**kwargs):
+                calls.append(kwargs)
+                return self._completed(f"第{len(calls)}段")
+
+            openai_cls.return_value.chat.completions.create.side_effect = fake_create
+            model = QwenApiTranscriber()
+            segments = model.transcribe(str(audio_path), language="zh")
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([s.start for s in segments], [0.0, 60.0])
+        self.assertEqual([s.end for s in segments], [60.0, 61.0])
+        self.assertFalse(list(Path(tmp).glob("*_apichunk*")), "临时切片应已清理")
 
 
 if __name__ == "__main__":

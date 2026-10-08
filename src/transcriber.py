@@ -19,6 +19,9 @@ QWEN_MODELS = {
     for size in ("0.6B", "1.7B")
     for alias in (size.lower(), f"qwen3-asr-{size.lower()}", f"qwen/qwen3-asr-{size.lower()}")
 }
+# Cloud ASR via any OpenAI-compatible endpoint (Aliyun Bailian / DashScope);
+# configured through ASR_API_BASE / ASR_API_KEY / ASR_MODEL in .env.
+API_MODELS = {"qwen3-asr-flash", "asr-flash", "qwen-asr-api"}
 
 
 @dataclass
@@ -116,6 +119,12 @@ def load_local_model(
     """Load a reusable local transcriber; Qwen defaults to batch 1, Whisper to 16."""
     if batch_size is not None and batch_size < 1:
         raise ValueError("batch_size must be at least 1")
+    if model_size.lower() in API_MODELS:
+        from src.qwen_api_backend import QwenApiTranscriber
+
+        # Generic aliases let ASR_MODEL in .env pick the deployed model name.
+        model_id = None if model_size.lower() in ("asr-flash", "qwen-asr-api") else model_size.lower()
+        return QwenApiTranscriber(model_id=model_id)
     qwen_model = QWEN_MODELS.get(model_size.lower())
     if qwen_model:
         from src.qwen_asr_backend import QwenTranscriber

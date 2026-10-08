@@ -119,6 +119,9 @@ python main.py transcribe "https://interactivemeta.cmc.zju.edu.cn/#/replay?cours
 # 使用 OpenAI API 转录
 python main.py transcribe "URL" --mode api
 
+# 使用云端 Qwen3-ASR（阿里云百练等 OpenAI 兼容端点，见下方「云端 ASR」）
+python main.py transcribe "URL" --model qwen3-asr-flash
+
 # 使用较小的 Qwen3-ASR-0.6B
 python main.py transcribe "URL" --model 0.6b
 
@@ -139,6 +142,23 @@ Qwen 模型参数支持 `1.7b` / `0.6b`、`qwen3-asr-1.7b` / `qwen3-asr-0.6b`，
 也支持完整名称 `Qwen/Qwen3-ASR-1.7B` / `Qwen/Qwen3-ASR-0.6B`，大小写不敏感。
 `--mode api` 仍使用 OpenAI Whisper API，`--model` 仅控制本地模式。
 
+### 云端 ASR（推荐弱 CPU 机器使用）
+
+本地跑不动 Qwen3-ASR / Whisper 时，可把转录放到任意 OpenAI 兼容端点（如阿里云百练专属工作台）。
+在 `.env` 中配置后，`--model qwen3-asr-flash` 即走云端（录播转录和直播监控均支持）：
+
+```env
+ASR_API_BASE="https://ws-xxxx.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+ASR_API_KEY="sk-xxx"
+ASR_MODEL="qwen3-asr-flash"
+```
+
+- 音频以 base64 WAV 通过 `chat/completions` 发送（实测百炼格式：`{"type": "audio", "audio": "data:..."}`，自动回退 `input_audio` / `audio_url`），长录播自动按 60 秒切片合并
+- 通用别名 `asr-flash` / `qwen-asr-api` 会使用 `ASR_MODEL` 指定的模型名（工作台部署名不同时改这里）
+- 该端点 ASR 任务不接受文本指令，语言为自动检测（中英文课堂实测正常）
+- API 模式无字级时间戳，SRT 为切片粒度；直播监控不受影响（本就不需要时间戳）
+- 模型输出若带 `language X<asr_text>` 包装会自动剥离，普通纯文本也兼容（不加载本地大模型，弱 CPU 机器友好）
+
 Qwen 录播转录会额外加载 `Qwen/Qwen3-ForcedAligner-0.6B` 来生成字幕时间戳，首次使用时也需下载该模型。
 长音频由官方 SDK 自动切分并合并时间戳；字词时间戳会合并为字幕片段，保留原转录的标点。
 ASR 支持 30 种语言；时间戳对齐支持中文、英文、粤语、法语、德语、意大利语、日语、韩语、葡萄牙语、俄语、西班牙语，参见[官方说明](https://github.com/QwenLM/Qwen3-ASR)。
@@ -157,6 +177,9 @@ python main.py monitor --debug
 
 # 使用 Qwen3-ASR-0.6B
 python main.py monitor --model 0.6b --debug
+
+# 使用云端 Qwen3-ASR（弱 CPU 机器推荐，需在 .env 配置 ASR_API_*）
+python main.py monitor --model qwen3-asr-flash --debug
 
 # 使用原来的 Whisper small
 python main.py monitor --model small --debug
@@ -180,7 +203,7 @@ python main.py monitor --log-dir logs --chunks-dir chunks
 |------|--------|------|
 | `--course-id` | 自动检测 | 课程 ID，省略时从课表自动发现直播 |
 | `--keywords` | `小测,点到,考勤,点名,学在浙大,quiz,雷达` | 逗号分隔的关键词 |
-| `--model` | `qwen3-asr-1.7b` | 支持 Qwen 1.7b/0.6b 或 Whisper tiny/base/small/medium/large-v3 等 |
+| `--model` | `qwen3-asr-1.7b` | 支持 Qwen 1.7b/0.6b、云端 qwen3-asr-flash 或 Whisper tiny/base/small/medium/large-v3 等 |
 | `--batch-size` | Qwen: `1` / Whisper: `16` | 本地推理批处理大小，增大需要更多显存 |
 | `--chunk-duration` | `30` | 每段音频长度（秒） |
 | `--poll-interval` | `15` | 无直播时轮询间隔（秒） |
@@ -255,7 +278,7 @@ python main.py monitor --log-dir logs --chunks-dir chunks
 
 ## 注意事项
 
-- **直播监控建议使用 GPU** — CPU 推理可能导致音频切片积压；显存不足可使用 `--model 0.6b`，或切回 `--model small` 使用 Whisper
+- **直播监控建议使用 GPU** — CPU 推理可能导致音频切片积压；显存不足可使用 `--model 0.6b`，或切回 `--model small` 使用 Whisper；弱 CPU 机器建议 `--model qwen3-asr-flash` 走云端 ASR
 - **Token 自动刷新** — 设置 `ZJU_USERNAME`/`ZJU_PASSWORD` 后，Token 过期时 monitor 自动重新登录（最多重试 3 次）；若未设置账号密码，过期后进程退出
 - **钉钉加签** — Webhook 必须启用「加签」安全设置，`DINGTALK_SECRET` 为签名密钥（以 `SEC` 开头）
 - **LLM 调用次数** — 每次启动会为每个已配置服务各发起一次检查调用；冷却期外，每个命中的片段正常用一次调用完成确认和语境分析，主服务失败后才调用已配置的备用服务。各调用最多重试两次。明确否定不会进入冷却，已成功发送的确认告警和疑似提醒均进入 120 秒冷却

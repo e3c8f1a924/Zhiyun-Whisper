@@ -70,7 +70,7 @@ def cli():
     "--model",
     default=DEFAULT_MODEL,
     show_default=True,
-    help="Local model: qwen3-asr-1.7b/0.6b (or 1.7b/0.6b), or Whisper tiny/base/small/medium/large-v3",
+    help="Model: qwen3-asr-1.7b/0.6b, qwen3-asr-flash (cloud API), or Whisper tiny/base/small/medium/large-v3",
 )
 @click.option(
     "--language",
@@ -232,7 +232,7 @@ def list_lessons(course_id: str):
     "--model",
     default=DEFAULT_MODEL,
     show_default=True,
-    help="Local model: qwen3-asr-1.7b/0.6b (or 1.7b/0.6b), or Whisper tiny/base/small/medium/large-v3",
+    help="Model: qwen3-asr-1.7b/0.6b, qwen3-asr-flash (cloud API), or Whisper tiny/base/small/medium/large-v3",
 )
 @click.option(
     "--batch-size",
